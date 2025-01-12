@@ -5,12 +5,16 @@ import os
 import numpy as np
 from librosa.feature import melspectrogram
 import matplotlib.pyplot as plt
+import pandas as pd
 from sklearn.metrics import ConfusionMatrixDisplay
+import seaborn as sns
 
 # CONSTANTS FOR AUDIO FILE PATHS
 representative_folder = "audio_files/groups_audio/representative"
 training_folder = "audio_files/groups_audio/train"
 evaluation_folder = "audio_files/groups_audio/evaluation"
+BLANK = "^"
+
 
 def main():
     # resample_data()
@@ -25,11 +29,13 @@ def main():
     threshold = np.max(dtw_mat)
     representative_spectrograms, training_spectrograms, eval_spectrograms = spectrogram_dict_to_array(spectrogram_dict)
     # 3f
-    accuracy, _ = determine_classifications_and_accuracy(training_spectrograms, representative_spectrograms, threshold, normalize)
-    print(f"Training accuracy = {accuracy}") #0.2
+    accuracy, _ = determine_classifications_and_accuracy(training_spectrograms, representative_spectrograms, threshold,
+                                                         normalize)
+    print(f"Training accuracy = {accuracy}")  # 0.2
     # 3g
-    accuracy, classifications = determine_classifications_and_accuracy(eval_spectrograms, representative_spectrograms, threshold, normalize)
-    print(f"Eval accuracy = {accuracy}") #0.275
+    accuracy, classifications = determine_classifications_and_accuracy(eval_spectrograms, representative_spectrograms,
+                                                                       threshold, normalize)
+    print(f"Eval accuracy = {accuracy}")  # 0.275
     confusion_matrix = calc_confusion_matrix(classifications)
     # 3h. display confusion matrix
     labels = np.arange(0, 10)
@@ -37,8 +43,121 @@ def main():
     disp.plot(cmap="Blues")
     plt.title("Confusion Matrix")
     plt.show()
+    # q5 CTC
 
 
+def ctc_collapse(str):
+    result = ""
+    if len(str) == 0:
+        return result
+    if len(str) == 1:
+        if str[0] != BLANK:
+            return str
+        else:
+            return result
+    for i in range(len(str) - 1):
+        if str[i] != str[i + 1] and str[i] != BLANK:
+            result += str[i]
+    if (str[-1] != str[-2]) and (str[-1] != BLANK):
+        result += str[-1]
+    return result
+
+
+def create_prob_mat():
+    labels = {'a': 0, 'b': 1, "^": 2}
+    pred = np.zeros(shape=(5, 3), dtype=np.float32)
+    pred[0][0] = 0.8
+    pred[0][1] = 0.2
+    pred[1][0] = 0.2
+    pred[1][1] = 0.8
+    pred[2][0] = 0.3
+    pred[2][1] = 0.7
+    pred[3][0] = 0.09
+    pred[3][1] = 0.8
+    pred[3][2] = 0.11
+    pred[4][2] = 1.00
+    return pred, labels
+
+
+def ctc_forward_pass(output, p_matrix: np.ndarray, labels):
+    new_output = ""
+    for char in output:
+        new_output += BLANK
+        new_output += char
+    new_output += BLANK
+    alpha_matrix = np.zeros((p_matrix.shape[0], len(new_output)))
+    alpha_matrix[0, 0] = p_matrix[0, labels[new_output[0]]]
+    alpha_matrix[0, 1] = p_matrix[0, labels[new_output[1]]]
+    for t in range(1, alpha_matrix.shape[0]):
+        for s in range(len(new_output)):
+            p_from_prev_letter, p_from_blank, p_curr_letter = 0, 0, 0
+            if s >= 2:
+                p_from_prev_letter = alpha_matrix[t-1, s-2]
+            if s >= 1:
+                p_from_blank = alpha_matrix[t-1, s-1]
+            p_curr_letter = alpha_matrix[t-1, s]
+            alpha_matrix[t, s] = p_matrix[t, labels[new_output[s]]] * (p_from_blank + p_curr_letter + p_from_prev_letter)
+
+    df = pd.DataFrame(alpha_matrix.T, index=list(new_output), columns=np.arange(alpha_matrix.shape[0]))
+    plt.figure(figsize=(12, 6))
+    sns.heatmap(df, annot=True, fmt=".2f", cmap="Blues", cbar_kws={'label': 'Probability'})
+    plt.title("Forward Matrix Heatmap")
+    plt.xlabel("Time Steps")
+    plt.ylabel("Extended Target Sequence")
+    plt.show()
+    return alpha_matrix[-1, -1] + alpha_matrix[-1, -2]
+
+def modified_ctc_forward_pass(output, p_matrix: np.ndarray, labels):
+    new_output = ""
+    for char in output:
+        new_output += BLANK
+        new_output += char
+    new_output += BLANK
+    alpha_matrix = np.zeros((p_matrix.shape[0], len(new_output)))
+    alpha_matrix[0, 0] = p_matrix[0, labels[new_output[0]]]
+    alpha_matrix[0, 1] = p_matrix[0, labels[new_output[1]]]
+    backtrack_path = []
+    prob = 1
+    for t in range(1, alpha_matrix.shape[0]):
+        for s in range(len(new_output)):
+            p_from_prev_letter, p_from_blank, p_curr_letter = 0, 0, 0
+            if s >= 2:
+                p_from_prev_letter = alpha_matrix[t - 1, s - 2]
+            if s >= 1:
+                p_from_blank = alpha_matrix[t - 1, s - 1]
+            p_curr_letter = alpha_matrix[t - 1, s]
+            alpha_matrix[t, s] = p_matrix[t, labels[new_output[s]]] * (max(p_from_blank, p_curr_letter , p_from_prev_letter))
+    path, sequence_labels, path_probability = find_maximum_path(alpha_matrix, new_output)
+    print(path_probability)
+    print(f'label: {sequence_labels}')
+def find_maximum_path(alpha_matrix, new_output):
+    T, S = alpha_matrix.shape  # Dimensions of the alpha matrix
+    path = []  # To store the indices of the path
+    path_sequence = []  # To store the corresponding characters
+    probability = 1
+    # Start from the last time step and find the position with the maximum value
+    s = np.argmax(alpha_matrix[-1][S-2:])  # Start at the position with max value at time T
+    path.append(s)
+    probability *= alpha_matrix[T-1, s]
+    path_sequence.append(new_output[s])
+
+    # Backtrack through the matrix
+    for t in range(T - 2, -1, -1):  # From second-to-last row back to the first row
+        max_prob = alpha_matrix[t, s]
+        if s >= 1 and alpha_matrix[t, s - 1] > max_prob:
+            s = s - 1
+        elif s >= 2 and alpha_matrix[t, s - 2] > max_prob:
+            s = s - 2
+        # No else because `s` can stay the same if it's the maximum path
+        probability *= alpha_matrix[t, s]
+        path.append(s)
+        path_sequence.append(new_output[s])
+
+    # Reverse the path to get it in forward order
+    path.reverse()
+    path_sequence.reverse()
+
+    return path, ''.join(path_sequence), probability
 def calc_confusion_matrix(classifications):
     confusion_matrix = np.zeros((10, 10))
     for i in range(len(classifications)):
@@ -48,16 +167,17 @@ def calc_confusion_matrix(classifications):
     return confusion_matrix
 
 
-
 def determine_classifications_and_accuracy(samples, representative_samples, threshold, normalize=False):
     # samples = spectrograms of 0 to 9 of speakers (multiple), representative_samples = spectrograms of 0 to 9 of representative
     true_labels = np.arange(10)
     correct_classifications = 0
     classifications = np.zeros((len(samples), 10))
     for speaker_idx in range(len(samples)):
-        classifications[speaker_idx] = determine_classification_single_speaker(samples[speaker_idx], representative_samples, threshold, normalize)
+        classifications[speaker_idx] = determine_classification_single_speaker(samples[speaker_idx],
+                                                                               representative_samples, threshold,
+                                                                               normalize)
         correct_classifications += np.sum(classifications[speaker_idx] == true_labels)
-    return correct_classifications / (len(samples)*10), classifications.astype(int)
+    return correct_classifications / (len(samples) * 10), classifications.astype(int)
 
 
 def determine_classification_single_speaker(samples, representative_samples, threshold, normalize=False):
@@ -77,7 +197,7 @@ def calculate_accuracy(predictions, true_labels):
     return (correct / len(true_labels)) * 100
 
 
-def create_mel(normalize = False):
+def create_mel(normalize=False):
     sample_rate = 16000
     window_size = int(0.025 * sample_rate)
     hop_size = int(0.01 * sample_rate)
@@ -107,6 +227,7 @@ def create_mel(normalize = False):
         plt.close()  # Close the figure to free memory
     return spectrogram_dict
 
+
 # AGC from ex1
 def auto_gain_control(audio, sample_rate):
     rms_values = []
@@ -117,7 +238,7 @@ def auto_gain_control(audio, sample_rate):
 
     for start in range(0, len(audio) - window_size + 1, hop_size):
         frame = audio[start:start + window_size]
-        rms_values.append(np.sqrt(np.mean(frame**2)))
+        rms_values.append(np.sqrt(np.mean(frame ** 2)))
 
     rms_values = np.array(rms_values)
     rms_values_db = 20 * np.log10(rms_values + 1e-12)
@@ -133,7 +254,7 @@ def auto_gain_control(audio, sample_rate):
     gains_db[high_rms_indices] = desired_rms_db - smooth_rms_db[high_rms_indices]
     gains = 10 ** (gains_db / 20.0)
 
-    gain_interpolated = np.interp(np.arange(len(audio)), np.arange(0, len(audio)-window_size+1, hop_size), gains)
+    gain_interpolated = np.interp(np.arange(len(audio)), np.arange(0, len(audio) - window_size + 1, hop_size), gains)
     return audio * gain_interpolated
 
 
@@ -182,23 +303,22 @@ def dtw(spectrogram_a, spectrogram_b, normalize=False):
     m, n = np.shape(spectrogram_a)[1], np.shape(spectrogram_b)[1]
     DTW = np.full((m, n), np.inf)
 
-    DTW[0][0] = np.linalg.norm(spectrogram_a[:,0] - spectrogram_b[:,0])
+    DTW[0][0] = np.linalg.norm(spectrogram_a[:, 0] - spectrogram_b[:, 0])
     for i in range(1, m):
-        DTW[i][0] = DTW[i-1][0] + np.linalg.norm(spectrogram_a[:,i] - spectrogram_b[:,0])
+        DTW[i][0] = DTW[i - 1][0] + np.linalg.norm(spectrogram_a[:, i] - spectrogram_b[:, 0])
     for j in range(1, n):
-        DTW[0][j] = DTW[0][j-1] + np.linalg.norm(spectrogram_a[:,0] - spectrogram_b[:,j])
-
+        DTW[0][j] = DTW[0][j - 1] + np.linalg.norm(spectrogram_a[:, 0] - spectrogram_b[:, j])
 
     for i in range(1, m):
         for j in range(1, n):
-            DTW[i][j] = np.linalg.norm(spectrogram_a[:,i] - spectrogram_b[:,j]) + min(
-                DTW[i-1][j],    # Insertion
-                DTW[i][j-1],    # Deletion
-                DTW[i-1][j-1]   # Match
+            DTW[i][j] = np.linalg.norm(spectrogram_a[:, i] - spectrogram_b[:, j]) + min(
+                DTW[i - 1][j],  # Insertion
+                DTW[i][j - 1],  # Deletion
+                DTW[i - 1][j - 1]  # Match
             )
 
     path = []
-    i, j = m-1, n-1
+    i, j = m - 1, n - 1
     while i > 0 or j > 0:
         path.append((i, j))
         if i == 0:
@@ -206,9 +326,9 @@ def dtw(spectrogram_a, spectrogram_b, normalize=False):
         elif j == 0:
             i -= 1
         else:
-            if DTW[i-1][j] == min(DTW[i-1][j], DTW[i][j-1], DTW[i-1][j-1]):
+            if DTW[i - 1][j] == min(DTW[i - 1][j], DTW[i][j - 1], DTW[i - 1][j - 1]):
                 i -= 1
-            elif DTW[i][j-1] == min(DTW[i-1][j], DTW[i][j-1], DTW[i-1][j-1]):
+            elif DTW[i][j - 1] == min(DTW[i - 1][j], DTW[i][j - 1], DTW[i - 1][j - 1]):
                 j -= 1
             else:
                 i -= 1
@@ -216,8 +336,8 @@ def dtw(spectrogram_a, spectrogram_b, normalize=False):
     path.append((0, 0))
     path.reverse()
     if normalize:
-        DTW[m-1][n-1] /= max(m, n)
-    return DTW[m-1][n-1], path
+        DTW[m - 1][n - 1] /= max(m, n)
+    return DTW[m - 1][n - 1], path
 
 
 def compare_audio_recording(spectrogram_dict, normalize=False):
@@ -230,7 +350,7 @@ def compare_audio_recording(spectrogram_dict, normalize=False):
     dist_matrix = np.zeros((4, 10))
     for i in range(10):
         for j in range(4):
-            dist_matrix[j][i], _ = dtw(representative_spectrograms[i], training_spectrograms[j*10+i], normalize)
+            dist_matrix[j][i], _ = dtw(representative_spectrograms[i], training_spectrograms[j * 10 + i], normalize)
             print(f"done with i = {i}, j = {j}")
     return dist_matrix
 
@@ -246,13 +366,18 @@ def spectrogram_dict_to_array(spectrogram_dict):
         training_spectrograms.append(spectrogram_dict[os.path.splitext(file_name)[0]])
     for file_name in os.listdir(evaluation_folder):
         eval_spectrograms.append(spectrogram_dict[os.path.splitext(file_name)[0]])
-    training_spectrograms_f = [training_spectrograms[i : i+10] for i in range(0, 40, 10)]
+    training_spectrograms_f = [training_spectrograms[i: i + 10] for i in range(0, 40, 10)]
     eval_spectrograms_f = [eval_spectrograms[i: i + 10] for i in range(0, 40, 10)]
     return representative_spectrograms, training_spectrograms_f, eval_spectrograms_f
 
 
+def test():
+    print(modified_ctc_forward_pass("aba", create_prob_mat()[0], create_prob_mat()[1]))
+
+
 # Press the green button in the gutter to run the script.
 if __name__ == '__main__':
-    main()
+    test()
+    #main()
 
 # See PyCharm help at https://www.jetbrains.com/help/pycharm/
