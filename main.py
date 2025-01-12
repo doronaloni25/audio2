@@ -5,7 +5,7 @@ import os
 import numpy as np
 from librosa.feature import melspectrogram
 import matplotlib.pyplot as plt
-from pydub import AudioSegment
+from sklearn.metrics import ConfusionMatrixDisplay
 
 # CONSTANTS FOR AUDIO FILE PATHS
 representative_folder = "audio_files/groups_audio/representative"
@@ -14,8 +14,10 @@ evaluation_folder = "audio_files/groups_audio/evaluation"
 
 def main():
     # resample_data()
-    spectrogram_dict = create_mel()
-    dtw_mat = compare_audio_recording(spectrogram_dict)
+    # 3h, change to True to improve results
+    normalize = False
+    spectrogram_dict = create_mel(normalize)
+    dtw_mat = compare_audio_recording(spectrogram_dict, normalize)
     np.set_printoptions(precision=2, suppress=True, linewidth=200)
     print(dtw_mat)
     # we want to classify every training audio correctly - therefore we want each sample to have its dtw dist <= threshold
@@ -23,13 +25,18 @@ def main():
     threshold = np.max(dtw_mat)
     representative_spectrograms, training_spectrograms, eval_spectrograms = spectrogram_dict_to_array(spectrogram_dict)
     # 3f
-    accuracy, _ = determine_classifications_and_accuracy(training_spectrograms, representative_spectrograms, threshold)
+    accuracy, _ = determine_classifications_and_accuracy(training_spectrograms, representative_spectrograms, threshold, normalize)
     print(f"Training accuracy = {accuracy}") #0.2
     # 3g
-    accuracy, classifications = determine_classifications_and_accuracy(eval_spectrograms, representative_spectrograms, threshold)
-    print(f"Eval accuracy = {accuracy}")
+    accuracy, classifications = determine_classifications_and_accuracy(eval_spectrograms, representative_spectrograms, threshold, normalize)
+    print(f"Eval accuracy = {accuracy}") #0.275
     confusion_matrix = calc_confusion_matrix(classifications)
-    print(f"Confusion Matrix:\n{confusion_matrix}")
+    # 3h. display confusion matrix
+    labels = np.arange(0, 10)
+    disp = ConfusionMatrixDisplay(confusion_matrix=confusion_matrix, display_labels=labels)
+    disp.plot(cmap="Blues")
+    plt.title("Confusion Matrix")
+    plt.show()
 
 
 def calc_confusion_matrix(classifications):
@@ -42,42 +49,27 @@ def calc_confusion_matrix(classifications):
 
 
 
-def determine_classifications_and_accuracy(samples, representative_samples, threshold):
+def determine_classifications_and_accuracy(samples, representative_samples, threshold, normalize=False):
     # samples = spectrograms of 0 to 9 of speakers (multiple), representative_samples = spectrograms of 0 to 9 of representative
     true_labels = np.arange(10)
     correct_classifications = 0
     classifications = np.zeros((len(samples), 10))
     for speaker_idx in range(len(samples)):
-        classifications[speaker_idx] = determine_classification_single_speaker(samples[speaker_idx], representative_samples, threshold)
+        classifications[speaker_idx] = determine_classification_single_speaker(samples[speaker_idx], representative_samples, threshold, normalize)
         correct_classifications += np.sum(classifications[speaker_idx] == true_labels)
     return correct_classifications / (len(samples)*10), classifications.astype(int)
 
 
-def determine_classification_single_speaker(samples, representative_samples, threshold):
+def determine_classification_single_speaker(samples, representative_samples, threshold, normalize=False):
     # samples = spectrograms of 0 to 9 of speaker, representative_samples = spectrograms of 0 to 9 of representative
     dtw_scores = np.zeros((len(samples), len(representative_samples)))
     for i in range(len(samples)):
         for j in range(len(representative_samples)):
-            dtw_scores[i][j], _ = dtw(samples[i], representative_samples[j])
+            dtw_scores[i][j], _ = dtw(samples[i], representative_samples[j], normalize)
     min_scores = np.min(dtw_scores, axis=1)
     classifications = np.argmin(dtw_scores, axis=1)
     classifications[min_scores > threshold] = -1
     return classifications
-
-
-def agc(y, sr):
-    audio = AudioSegment(
-        y.tobytes(),
-        frame_rate=sr,
-        sample_width=y.dtype.itemsize,
-        channels=1
-    )
-
-    normalized_audio = audio.apply_gain(-audio.max_dBFS)
-
-    y_agc = np.array(normalized_audio.get_array_of_samples()).astype(np.float32) / (2**15)
-
-    return y_agc
 
 
 def calculate_accuracy(predictions, true_labels):
@@ -85,7 +77,7 @@ def calculate_accuracy(predictions, true_labels):
     return (correct / len(true_labels)) * 100
 
 
-def create_mel(normalize_agc = False):
+def create_mel(normalize = False):
     sample_rate = 16000
     window_size = int(0.025 * sample_rate)
     hop_size = int(0.01 * sample_rate)
@@ -95,10 +87,10 @@ def create_mel(normalize_agc = False):
     spectrogram_dict = {}
     for file_name in os.listdir(input_folder):
         input_f = os.path.join(input_folder, file_name)
-        audio, _ = librosa.load(input_f, sr=16000)
+        audio, _ = librosa.load(input_f, sr=sample_rate)
         audio = audio.astype(np.float32) / np.max(np.abs(audio))
-        if normalize_agc:
-            audio = agc(audio, 16000)
+        if normalize:
+            audio = auto_gain_control(audio, sample_rate)
         mel_spectrogram = melspectrogram(y=audio, sr=sample_rate, n_fft=window_size, hop_length=hop_size, n_mels=80)
         mel_spectrogram_db = librosa.power_to_db(mel_spectrogram, ref=np.max)
         spectrogram_dict[os.path.splitext(file_name)[0]] = mel_spectrogram_db
@@ -114,6 +106,36 @@ def create_mel(normalize_agc = False):
         plt.savefig(output_path, dpi=300, bbox_inches='tight', pad_inches=0.1)
         plt.close()  # Close the figure to free memory
     return spectrogram_dict
+
+# AGC from ex1
+def auto_gain_control(audio, sample_rate):
+    rms_values = []
+    noise_floor_db = -20
+    desired_rms_db = -10
+    window_size = int(0.02 * sample_rate)  # 20ms
+    hop_size = int(0.02 * sample_rate)  # 10ms
+
+    for start in range(0, len(audio) - window_size + 1, hop_size):
+        frame = audio[start:start + window_size]
+        rms_values.append(np.sqrt(np.mean(frame**2)))
+
+    rms_values = np.array(rms_values)
+    rms_values_db = 20 * np.log10(rms_values + 1e-12)
+    low_rms_indices = rms_values_db < noise_floor_db
+    high_rms_indices = rms_values_db >= noise_floor_db
+    smooth_rms_db = np.zeros(len(rms_values_db))
+    gains_db = np.zeros(len(rms_values_db))
+    for i in range(len(rms_values)):
+        start_idx = max(0, i - (sample_rate // 2))
+        end_idx = min(len(rms_values), i + (sample_rate // 2))
+        smooth_rms_db[i] = np.mean(rms_values[start_idx:end_idx])
+    gains_db[low_rms_indices] = 0
+    gains_db[high_rms_indices] = desired_rms_db - smooth_rms_db[high_rms_indices]
+    gains = 10 ** (gains_db / 20.0)
+
+    gain_interpolated = np.interp(np.arange(len(audio)), np.arange(0, len(audio)-window_size+1, hop_size), gains)
+    return audio * gain_interpolated
+
 
 def resample_data():
     # A. resample data
@@ -156,7 +178,7 @@ def downsample_resample_method(data, old_sample_rate, new_sample_rate):
     return resample(data, new_num_samples)
 
 
-def dtw(spectrogram_a, spectrogram_b):
+def dtw(spectrogram_a, spectrogram_b, normalize=False):
     m, n = np.shape(spectrogram_a)[1], np.shape(spectrogram_b)[1]
     DTW = np.full((m, n), np.inf)
 
@@ -193,11 +215,12 @@ def dtw(spectrogram_a, spectrogram_b):
                 j -= 1
     path.append((0, 0))
     path.reverse()
-
+    if normalize:
+        DTW[m-1][n-1] /= max(m, n)
     return DTW[m-1][n-1], path
 
 
-def compare_audio_recording(spectrogram_dict):
+def compare_audio_recording(spectrogram_dict, normalize=False):
     representative_spectrograms = []
     training_spectrograms = []
     for file_name in os.listdir(representative_folder):
@@ -207,7 +230,7 @@ def compare_audio_recording(spectrogram_dict):
     dist_matrix = np.zeros((4, 10))
     for i in range(10):
         for j in range(4):
-            dist_matrix[j][i], _ = dtw(representative_spectrograms[i], training_spectrograms[j*10+i])
+            dist_matrix[j][i], _ = dtw(representative_spectrograms[i], training_spectrograms[j*10+i], normalize)
             print(f"done with i = {i}, j = {j}")
     return dist_matrix
 
@@ -226,6 +249,8 @@ def spectrogram_dict_to_array(spectrogram_dict):
     training_spectrograms_f = [training_spectrograms[i : i+10] for i in range(0, 40, 10)]
     eval_spectrograms_f = [eval_spectrograms[i: i + 10] for i in range(0, 40, 10)]
     return representative_spectrograms, training_spectrograms_f, eval_spectrograms_f
+
+
 # Press the green button in the gutter to run the script.
 if __name__ == '__main__':
     main()
