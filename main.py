@@ -8,6 +8,8 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from sklearn.metrics import ConfusionMatrixDisplay
 import seaborn as sns
+import pickle as pkl
+
 
 # CONSTANTS FOR AUDIO FILE PATHS
 representative_folder = "audio_files/groups_audio/representative"
@@ -16,7 +18,7 @@ evaluation_folder = "audio_files/groups_audio/evaluation"
 BLANK = "^"
 
 
-def main():
+def q3():
     # resample_data()
     # 3h, change to True to improve results
     normalize = False
@@ -43,7 +45,6 @@ def main():
     disp.plot(cmap="Blues")
     plt.title("Confusion Matrix")
     plt.show()
-    # q5 CTC
 
 
 def ctc_collapse(str):
@@ -98,14 +99,15 @@ def ctc_forward_pass(output, p_matrix: np.ndarray, labels):
             p_curr_letter = alpha_matrix[t-1, s]
             alpha_matrix[t, s] = p_matrix[t, labels[new_output[s]]] * (p_from_blank + p_curr_letter + p_from_prev_letter)
 
-    df = pd.DataFrame(alpha_matrix.T, index=list(new_output), columns=np.arange(alpha_matrix.shape[0]))
+    df = pd.DataFrame(p_matrix.T, index=["a", "b", "^"], columns=np.arange(alpha_matrix.shape[0]))
     plt.figure(figsize=(12, 6))
     sns.heatmap(df, annot=True, fmt=".2f", cmap="Blues", cbar_kws={'label': 'Probability'})
-    plt.title("Forward Matrix Heatmap")
+    plt.title("Pred Matrix")
     plt.xlabel("Time Steps")
-    plt.ylabel("Extended Target Sequence")
+    plt.ylabel("Alphabet")
     plt.show()
     return alpha_matrix[-1, -1] + alpha_matrix[-1, -2]
+
 
 def modified_ctc_forward_pass(output, p_matrix: np.ndarray, labels):
     new_output = ""
@@ -116,27 +118,34 @@ def modified_ctc_forward_pass(output, p_matrix: np.ndarray, labels):
     alpha_matrix = np.zeros((p_matrix.shape[0], len(new_output)))
     alpha_matrix[0, 0] = p_matrix[0, labels[new_output[0]]]
     alpha_matrix[0, 1] = p_matrix[0, labels[new_output[1]]]
-    backtrack_path = []
-    prob = 1
+    back_trace = np.zeros(alpha_matrix.shape)
     for t in range(1, alpha_matrix.shape[0]):
         for s in range(len(new_output)):
             p_from_prev_letter, p_from_blank, p_curr_letter = 0, 0, 0
-            if s >= 2:
+            if s >= 2 and new_output[s] != BLANK:
                 p_from_prev_letter = alpha_matrix[t - 1, s - 2]
             if s >= 1:
                 p_from_blank = alpha_matrix[t - 1, s - 1]
             p_curr_letter = alpha_matrix[t - 1, s]
+            if p_from_blank == max(p_from_blank, p_curr_letter , p_from_prev_letter):
+                back_trace[t-1, s-1] += 1
+            elif p_curr_letter == max(p_from_blank, p_curr_letter , p_from_prev_letter):
+                back_trace[t-1, s] += 1
+            else:
+                back_trace[t-1, s-2] += 1
             alpha_matrix[t, s] = p_matrix[t, labels[new_output[s]]] * (max(p_from_blank, p_curr_letter , p_from_prev_letter))
     path, sequence_labels, path_probability = find_maximum_path(alpha_matrix, new_output)
-    print(path_probability)
-    print(f'label: {sequence_labels}')
+    plot_selected_path(back_trace.T, path, np.arange(back_trace.shape[0]), list(new_output))
+    print(f'Selected labels: {sequence_labels}')
+
+
 def find_maximum_path(alpha_matrix, new_output):
     T, S = alpha_matrix.shape  # Dimensions of the alpha matrix
     path = []  # To store the indices of the path
     path_sequence = []  # To store the corresponding characters
     probability = 1
     # Start from the last time step and find the position with the maximum value
-    s = np.argmax(alpha_matrix[-1][S-2:])  # Start at the position with max value at time T
+    s = S-2 + np.argmax(alpha_matrix[-1][-2:])  # Start at the position with max value at time T
     path.append(s)
     probability *= alpha_matrix[T-1, s]
     path_sequence.append(new_output[s])
@@ -146,7 +155,7 @@ def find_maximum_path(alpha_matrix, new_output):
         max_prob = alpha_matrix[t, s]
         if s >= 1 and alpha_matrix[t, s - 1] > max_prob:
             s = s - 1
-        elif s >= 2 and alpha_matrix[t, s - 2] > max_prob:
+        elif s >= 2 and alpha_matrix[t, s - 2] > max_prob and new_output[s] != BLANK:
             s = s - 2
         # No else because `s` can stay the same if it's the maximum path
         probability *= alpha_matrix[t, s]
@@ -158,6 +167,8 @@ def find_maximum_path(alpha_matrix, new_output):
     path_sequence.reverse()
 
     return path, ''.join(path_sequence), probability
+
+
 def calc_confusion_matrix(classifications):
     confusion_matrix = np.zeros((10, 10))
     for i in range(len(classifications)):
@@ -166,6 +177,44 @@ def calc_confusion_matrix(classifications):
                 confusion_matrix[j, classifications[i, j]] += 1
     return confusion_matrix
 
+
+def plot_selected_path(matrix, path, column_labels=None, row_labels=None):
+    """
+    Plots the matrix as a heatmap and overlays the path on top of it, centering the path line in the middle of each cell.
+
+    Parameters:
+        matrix (np.ndarray): 2D array representing the matrix (rows x columns).
+        path (list): List of row indices representing the path through the columns.
+        column_labels (list, optional): Labels for each column (e.g., time steps).
+        row_labels (list, optional): Labels for each row (e.g., values or states).
+    """
+    # Convert the matrix into a pandas DataFrame
+    df = pd.DataFrame(matrix, index=row_labels, columns=column_labels)
+
+    # Create the heatmap
+    plt.figure(figsize=(10, 6))
+    ax = sns.heatmap(df, annot=False, fmt=".2f", cmap="Blues", cbar_kws={'label': 'Value'}, linewidths=0.5,
+                     linecolor='gray')
+
+    # Overlay the path
+    x_coords = np.array(range(len(path))) + 0.5  # Center x-coordinates in the middle of cells
+    y_coords = np.array([path[col] for col in range(len(path))]) + 0.5  # Center y-coordinates in the middle of cells
+
+    plt.plot(x_coords, y_coords, color='red', marker='o', linewidth=2, label='Path')
+
+    # Add annotations for path points
+    for x, y in zip(x_coords, y_coords):
+        label = row_labels[int(y - 0.5)] if row_labels else int(y - 0.5)
+        plt.text(x, y, f"{label}", color='red', fontsize=10, ha='center', va='center')
+
+    # Add labels, title, and legend
+    plt.title('Back Trace With Selected Path')
+    plt.xlabel('Time')
+    plt.ylabel('Label')
+    plt.xticks(ticks=np.arange(len(column_labels)) + 0.5, labels=column_labels)
+    plt.yticks(ticks=np.arange(len(row_labels)) + 0.5, labels=row_labels)
+    plt.legend()
+    plt.show()
 
 def determine_classifications_and_accuracy(samples, representative_samples, threshold, normalize=False):
     # samples = spectrograms of 0 to 9 of speakers (multiple), representative_samples = spectrograms of 0 to 9 of representative
@@ -370,14 +419,22 @@ def spectrogram_dict_to_array(spectrogram_dict):
     eval_spectrograms_f = [eval_spectrograms[i: i + 10] for i in range(0, 40, 10)]
     return representative_spectrograms, training_spectrograms_f, eval_spectrograms_f
 
+def q5():
+    print(ctc_forward_pass("aba", create_prob_mat()[0], create_prob_mat()[1])) # 0.15
 
-def test():
-    print(modified_ctc_forward_pass("aba", create_prob_mat()[0], create_prob_mat()[1]))
+def q6():
+    modified_ctc_forward_pass("aba", create_prob_mat()[0], create_prob_mat()[1])
 
+def q7():
+    data = pkl.load(open('force_align.pkl', 'rb'))
+    labels = {v: k for k, v in data['label_mapping'].items()}
+    modified_ctc_forward_pass(data['text_to_align'], data['acoustic_model_out_probs'], labels)
 
 # Press the green button in the gutter to run the script.
 if __name__ == '__main__':
-    test()
-    #main()
+    #q6()
+    #q7()
+    #q3()
+    q5()
 
 # See PyCharm help at https://www.jetbrains.com/help/pycharm/
